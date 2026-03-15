@@ -1,0 +1,1194 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no" />
+  <title>NewFantaMaster</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+    body { font-family: 'Inter', system-ui, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; }
+    * { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+    input, select, textarea { font-size: 16px !important; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-thumb { background: #d0d0d0; border-radius: 3px; }
+    input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script type="text/babel" data-presets="react">
+
+const SB_URL = "https://yqaxcpkjqvtroxinjjvw.supabase.co";
+const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InlxYXhjcGtqcXZ0cm94aW5qanZ3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM1MTY5NDIsImV4cCI6MjA4OTA5Mjk0Mn0._Mdl2XxSQ8KjXuSg3elwnZMgzcC7OMQ6GNlQmwSH_jc";
+const HDR = { "Content-Type": "application/json", apikey: SB_KEY, Authorization: "Bearer " + SB_KEY };
+
+// ── DB helpers ────────────────────────────────────────────────────────────────
+async function dbGet(table, qs) {
+  const r = await fetch(SB_URL + "/rest/v1/" + table + (qs || ""), { headers: HDR });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function dbPost(table, body) {
+  const r = await fetch(SB_URL + "/rest/v1/" + table, {
+    method: "POST", headers: { ...HDR, Prefer: "return=representation" },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function dbPatch(table, qs, body) {
+  const r = await fetch(SB_URL + "/rest/v1/" + table + qs, {
+    method: "PATCH", headers: { ...HDR, Prefer: "return=representation" },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+async function rpc(fn, body) {
+  const r = await fetch(SB_URL + "/rest/v1/rpc/" + fn, {
+    method: "POST", headers: { ...HDR, Prefer: "return=representation" },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+async function doLogin(username, password) {
+  const users = await dbGet("league_users", "?username=eq." + encodeURIComponent(username) + "&select=id,username,display_name,is_admin,password_hash");
+  if (!users || !users.length) throw new Error("Utente non trovato");
+  const u = users[0];
+  const ok = await rpc("verify_password", { input_password: password, stored_hash: u.password_hash });
+  const valid = Array.isArray(ok) ? ok[0] : ok;
+  if (!valid) throw new Error("Password errata");
+  const sess = await dbPost("sessions", { user_id: u.id });
+  return { token: sess[0].token, user: { id: u.id, username: u.username, display_name: u.display_name, is_admin: u.is_admin } };
+}
+async function doLogout(token) {
+  await dbPatch("sessions", "?token=eq." + token, { is_active: false });
+}
+async function validateSession(token) {
+  const s = await dbGet("sessions", "?token=eq." + encodeURIComponent(token) + "&is_active=eq.true&expires_at=gt." + new Date().toISOString() + "&select=user_id");
+  if (!s || !s.length) return null;
+  const u = await dbGet("league_users", "?id=eq." + s[0].user_id + "&select=id,username,display_name,is_admin");
+  return u && u.length ? u[0] : null;
+}
+
+// ── Load matches ──────────────────────────────────────────────────────────────
+async function loadMatches(matchdayId) {
+  const [rawM, teams] = await Promise.all([
+    dbGet("matches", "?matchday_id=eq." + matchdayId + "&select=id,home_team_id,away_team_id,home_goals,away_goals,home_fantapunti,away_fantapunti,result,is_played&order=id.asc"),
+    dbGet("teams", "?select=id,name")
+  ]);
+  const tm = {};
+  teams.forEach(t => { tm[t.id] = t.name; });
+  return (rawM || []).map(m => ({ ...m, home_name: tm[m.home_team_id] || "?", away_name: tm[m.away_team_id] || "?" }));
+}
+
+// ── Prediction text helpers ───────────────────────────────────────────────────
+function buildText(picks, matches) {
+  return matches.map(m => m.home_name + " vs " + m.away_name + ": " + (picks[m.id] || "?")).join(" | ");
+}
+function parseText(text, matches) {
+  const picks = {};
+  if (!text) return picks;
+  text.split(" | ").forEach(part => {
+    const rx = /^(.+) vs (.+): ([1X2?])$/.exec(part);
+    if (!rx) return;
+    const m = matches.find(mx => mx.home_name === rx[1] && mx.away_name === rx[2]);
+    if (m) picks[m.id] = rx[3];
+  });
+  return picks;
+}
+
+// ── Global state ──────────────────────────────────────────────────────────────
+const { useState, useEffect, useCallback } = React;
+let _listeners = [];
+let _state = { loading: true, auth: null };
+function getState() { return _state; }
+function setState(patch) {
+  _state = { ..._state, ...patch };
+  _listeners.forEach(fn => fn(_state));
+}
+function useStore() {
+  const [s, setS] = useState(_state);
+  useEffect(() => {
+    _listeners.push(setS);
+    return () => { _listeners = _listeners.filter(f => f !== setS); };
+  }, []);
+  return s;
+}
+(async () => {
+  const t = localStorage.getItem("fm_token");
+  if (t) {
+    try {
+      const u = await validateSession(t);
+      if (u) { setState({ loading: false, auth: { token: t, user: u } }); return; }
+    } catch(e) {}
+  }
+  localStorage.removeItem("fm_token");
+  setState({ loading: false });
+})();
+
+// ── UI primitives ─────────────────────────────────────────────────────────────
+function Spin({ size }) {
+  return React.createElement("div", { style: { width: size || 24, height: size || 24, border: "2.5px solid #e0e0e0", borderTopColor: "#667eea", borderRadius: "50%", animation: "spin 0.7s linear infinite", flexShrink: 0 } });
+}
+
+function Btn({ children, onClick, disabled, color, small, style }) {
+  const base = { display: "inline-flex", alignItems: "center", gap: 6, padding: small ? "7px 14px" : "10px 20px", border: "none", borderRadius: 8, cursor: disabled ? "not-allowed" : "pointer", fontFamily: "inherit", fontSize: small ? 13 : 14, fontWeight: 600, opacity: disabled ? 0.5 : 1, transition: "opacity 0.15s", touchAction: "manipulation", ...style };
+  const colors = { primary: { background: "linear-gradient(135deg, #667eea, #764ba2)", color: "#fff" }, danger: { background: "#ef4444", color: "#fff" }, secondary: { background: "#f0f0f5", color: "#444" }, blue: { background: "#1565c0", color: "#fff" }, green: { background: "#059669", color: "#fff" } };
+  return React.createElement("button", { style: { ...base, ...(colors[color || "primary"] || colors.primary) }, onClick, disabled }, children);
+}
+
+function Card({ children, style }) {
+  return React.createElement("div", { style: { background: "#fff", borderRadius: 14, border: "1px solid #e8e8e8", padding: "20px 24px", ...style } }, children);
+}
+
+function Alert({ type, children }) {
+  const styles = { success: { background: "#f0fdf4", border: "1px solid #bbf7d0", color: "#15803d" }, error: { background: "#fef2f2", border: "1px solid #fecaca", color: "#dc2626" }, warning: { background: "#fffbeb", border: "1px solid #fde68a", color: "#92400e" }, info: { background: "#eff6ff", border: "1px solid #bfdbfe", color: "#1d4ed8" } };
+  return React.createElement("div", { style: { padding: "10px 14px", borderRadius: 8, fontSize: 13, ...styles[type || "info"] } }, children);
+}
+
+function Badge({ color, children }) {
+  const colors = { green: { background: "#dcfce7", color: "#15803d" }, red: { background: "#fee2e2", color: "#dc2626" }, blue: { background: "#dbeafe", color: "#1d4ed8" }, amber: { background: "#fef9c3", color: "#92400e" }, purple: { background: "#f3e8ff", color: "#7c3aed" }, gray: { background: "#f3f4f6", color: "#6b7280" } };
+  return React.createElement("span", { style: { display: "inline-flex", alignItems: "center", padding: "3px 8px", borderRadius: 20, fontSize: 11, fontWeight: 700, ...colors[color || "gray"] } }, children);
+}
+
+function ResultPill({ result }) {
+  if (!result) return null;
+  const c = result === "1" ? { bg: "#dbeafe", fg: "#1d4ed8" } : result === "2" ? { bg: "#fee2e2", fg: "#dc2626" } : { bg: "#f3e8ff", fg: "#7c3aed" };
+  return React.createElement("span", { style: { display: "inline-flex", alignItems: "center", justifyContent: "center", width: 22, height: 22, borderRadius: 6, fontSize: 11, fontWeight: 800, background: c.bg, color: c.fg } }, result);
+}
+
+function PickBtn({ value, selected, disabled, onPick }) {
+  const cols = { "1": { on: "#dbeafe", fg: "#1d4ed8", border: "#3b82f6" }, "X": { on: "#f3e8ff", fg: "#7c3aed", border: "#8b5cf6" }, "2": { on: "#fee2e2", fg: "#dc2626", border: "#ef4444" } };
+  const c = cols[value];
+  return React.createElement("button", {
+    onClick: onPick, disabled,
+    style: { width: 32, height: 32, border: selected ? "2px solid " + c.border : "1.5px solid #e0e0e0", borderRadius: 7, cursor: disabled ? "default" : "pointer", background: selected ? c.on : "#fafafa", color: selected ? c.fg : "#aaa", fontWeight: 800, fontSize: 12, fontFamily: "inherit", transition: "all 0.1s", touchAction: "manipulation" }
+  }, value);
+}
+
+// ── Login ─────────────────────────────────────────────────────────────────────
+function LoginPage() {
+  const [u, setU] = useState("");
+  const [p, setP] = useState("");
+  const [err, setErr] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function handleLogin() {
+    if (!u || !p) { setErr("Inserisci username e password"); return; }
+    setLoading(true); setErr("");
+    try {
+      const data = await doLogin(u.trim().toLowerCase(), p);
+      localStorage.setItem("fm_token", data.token);
+      setState({ auth: data });
+    } catch(e) {
+      setErr(e.message || "Errore di login");
+    }
+    setLoading(false);
+  }
+
+  return React.createElement("div", { style: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%)" } },
+    React.createElement("div", { style: { width: "100%", maxWidth: 380, padding: "0 20px" } },
+      React.createElement("div", { style: { textAlign: "center", marginBottom: 32 } },
+        React.createElement("div", { style: { fontSize: 52, marginBottom: 8 } }, "⚽"),
+        React.createElement("div", { style: { fontFamily: "system-ui", fontSize: 28, fontWeight: 800, color: "#fff", letterSpacing: "0.05em" } }, "NEWFANTAMASTER"),
+        React.createElement("div", { style: { fontSize: 13, color: "rgba(255,255,255,0.45)", marginTop: 4 } }, "Private Fantasy League")
+      ),
+      React.createElement(Card, { style: { padding: 28 } },
+        React.createElement("div", { style: { marginBottom: 16 } },
+          React.createElement("label", { style: { display: "block", fontSize: 12, fontWeight: 600, color: "#888", marginBottom: 6, letterSpacing: "0.05em" } }, "USERNAME"),
+          React.createElement("input", { value: u, onChange: e => setU(e.target.value), onKeyDown: e => e.key === "Enter" && handleLogin(), placeholder: "il tuo username", style: { width: "100%", padding: "11px 14px", border: "1.5px solid #e0e0e0", borderRadius: 8, fontSize: 15, fontFamily: "inherit", outline: "none" } })
+        ),
+        React.createElement("div", { style: { marginBottom: 20 } },
+          React.createElement("label", { style: { display: "block", fontSize: 12, fontWeight: 600, color: "#888", marginBottom: 6, letterSpacing: "0.05em" } }, "PASSWORD"),
+          React.createElement("input", { type: "password", value: p, onChange: e => setP(e.target.value), onKeyDown: e => e.key === "Enter" && handleLogin(), placeholder: "la tua password", style: { width: "100%", padding: "11px 14px", border: "1.5px solid #e0e0e0", borderRadius: 8, fontSize: 15, fontFamily: "inherit", outline: "none" } })
+        ),
+        err && React.createElement("div", { style: { marginBottom: 16 } }, React.createElement(Alert, { type: "error" }, err)),
+        React.createElement(Btn, { onClick: handleLogin, disabled: loading, style: { width: "100%", justifyContent: "center" } }, loading ? React.createElement(Spin, { size: 16 }) : "Entra")
+      )
+    )
+  );
+}
+
+// ── Layout ────────────────────────────────────────────────────────────────────
+function Layout({ user, page, setPage, children }) {
+  const navItems = [
+    { id: "home", label: "Home", icon: "🏠" },
+    { id: "standings", label: "Classifica", icon: "🏆" },
+    { id: "calendar", label: "Calendario", icon: "📅" },
+    ...(user.is_admin ? [] : [{ id: "history", label: "Storico", icon: "📖" }]),
+    ...(user.is_admin ? [{ id: "admin", label: "Admin", icon: "⚙️" }] : []),
+  ];
+  function logout() {
+    const t = localStorage.getItem("fm_token");
+    localStorage.removeItem("fm_token");
+    if (t) doLogout(t).catch(() => {});
+    setState({ auth: null });
+  }
+  return React.createElement("div", { style: { display: "flex", minHeight: "100vh", background: "#f5f6fa" } },
+    // Desktop sidebar
+    React.createElement("aside", { style: { width: 220, background: "linear-gradient(180deg, #1a1a2e 0%, #16213e 100%)", display: "flex", flexDirection: "column", flexShrink: 0, position: "sticky", top: 0, height: "100vh", overflowY: "auto" }, className: "desktop-sidebar" },
+      React.createElement("div", { style: { padding: "20px 16px 16px", borderBottom: "1px solid rgba(255,255,255,0.08)", marginBottom: 8 } },
+        React.createElement("div", { style: { fontSize: 15, fontWeight: 800, color: "#fff", letterSpacing: "0.06em" } }, "⚽ NEWFANTAMASTER"),
+        React.createElement("div", { style: { fontSize: 11, color: "rgba(255,255,255,0.35)", marginTop: 2 } }, "PRIVATE LEAGUE")
+      ),
+      React.createElement("nav", { style: { flex: 1, padding: "4px 8px" } },
+        navItems.map(item =>
+          React.createElement("button", { key: item.id, onClick: () => setPage(item.id), style: { display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderRadius: 8, border: "none", background: page === item.id ? "rgba(255,255,255,0.12)" : "none", color: page === item.id ? "#fff" : "rgba(255,255,255,0.55)", fontSize: 14, fontWeight: 500, fontFamily: "inherit", cursor: "pointer", width: "100%", textAlign: "left", marginBottom: 2 } },
+            React.createElement("span", null, item.icon), item.label
+          )
+        )
+      ),
+      React.createElement("div", { style: { padding: "12px 16px", borderTop: "1px solid rgba(255,255,255,0.08)" } },
+        React.createElement("div", { style: { fontSize: 13, color: "#fff", fontWeight: 500, marginBottom: 8 } }, user.display_name),
+        React.createElement("button", { onClick: logout, style: { fontSize: 12, color: "rgba(255,100,100,0.8)", background: "none", border: "none", cursor: "pointer", fontFamily: "inherit", padding: 0 } }, "Esci")
+      )
+    ),
+    // Main content
+    React.createElement("main", { style: { flex: 1, padding: "28px 32px", overflowY: "auto", animation: "fadeIn 0.2s ease" }, className: "main-content" },
+      children
+    ),
+    // Mobile bottom nav
+    React.createElement("nav", { style: { display: "none", position: "fixed", bottom: 0, left: 0, right: 0, zIndex: 1000, background: "linear-gradient(180deg, #1a1a2e, #16213e)", borderTop: "1px solid rgba(255,255,255,0.1)", paddingBottom: "max(6px, env(safe-area-inset-bottom))" }, className: "mobile-nav" },
+      [...navItems, { id: "logout", label: "Esci", icon: "🚪" }].map(item =>
+        React.createElement("button", { key: item.id, onClick: () => item.id === "logout" ? logout() : setPage(item.id), style: { flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 2, padding: "6px 0", background: "none", border: "none", color: page === item.id ? "#fff" : "rgba(255,255,255,0.45)", fontSize: 9, fontWeight: 600, fontFamily: "inherit", cursor: "pointer" } },
+          React.createElement("span", { style: { fontSize: 18 } }, item.icon), item.label
+        )
+      )
+    ),
+    // Mobile CSS
+    React.createElement("style", null, `
+      @media (max-width: 768px) {
+        .desktop-sidebar { display: none !important; }
+        .mobile-nav { display: flex !important; }
+        .main-content { padding: 14px 14px 72px !important; }
+        .two-col { grid-template-columns: 1fr !important; }
+        .md-grid { grid-template-columns: repeat(8, 1fr) !important; }
+      }
+    `)
+  );
+}
+
+// ── Matchday status helper ────────────────────────────────────────────────────
+function mdStatus(md) {
+  if (md.is_completed) return { label: "Completata", dot: "#10b981", bg: "#f0fdf4", badge: "green" };
+  if (md.is_frozen)    return { label: "Congelata",  dot: "#1565c0", bg: "#eff6ff", badge: "blue" };
+  if (md.is_open)      return { label: "Aperta",     dot: "#f59e0b", bg: "#fffbeb", badge: "amber" };
+  return                      { label: "In arrivo",  dot: "#d1d5db", bg: "#f9fafb", badge: "gray" };
+}
+
+// ── HomePage ──────────────────────────────────────────────────────────────────
+function HomePage({ user }) {
+  const [loading, setLoading] = useState(true);
+  const [allMds, setAllMds] = useState([]);
+  const [allUsers, setAllUsers] = useState([]);
+  const [openMd, setOpenMd] = useState(null);
+  const [matches, setMatches] = useState([]);
+  const [picks, setPicks] = useState({});
+  const [savedPred, setSavedPred] = useState(null);
+  const [saveState, setSaveState] = useState("idle");
+  const [saveErr, setSaveErr] = useState("");
+  const [loadingMatches, setLoadingMatches] = useState(false);
+  const [allPreds, setAllPreds] = useState([]);
+  const [viewMd, setViewMd] = useState(null);
+  const [viewData, setViewData] = useState({ matches: [], preds: [] });
+  const [loadingView, setLoadingView] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const [mds, users] = await Promise.all([
+        dbGet("matchdays", "?order=number.asc&select=id,number,is_completed,is_frozen,is_open"),
+        dbGet("league_users", "?is_admin=eq.false&select=id,display_name,username&order=display_name.asc")
+      ]);
+      setAllMds(mds || []);
+      setAllUsers(users || []);
+      const open = (mds || []).find(m => m.is_open) || null;
+      setOpenMd(open);
+      if (open) {
+        setLoadingMatches(true);
+        const [ms, preds, myP] = await Promise.all([
+          loadMatches(open.id),
+          dbGet("predictions", "?matchday_id=eq." + open.id + "&select=id,user_id,prediction_text,submitted_at,updated_at,score"),
+          dbGet("predictions", "?matchday_id=eq." + open.id + "&user_id=eq." + user.id)
+        ]);
+        setMatches(ms);
+        setAllPreds(preds || []);
+        if (myP && myP.length) {
+          setSavedPred(myP[0]);
+          setPicks(parseText(myP[0].prediction_text, ms));
+          setSaveState("saved");
+        }
+        setLoadingMatches(false);
+      }
+      setLoading(false);
+    })();
+  }, [user.id]);
+
+  useEffect(() => {
+    if (!viewMd) return;
+    setLoadingView(true);
+    setViewData({ matches: [], preds: [] });
+    (async () => {
+      const [ms, preds] = await Promise.all([
+        loadMatches(viewMd.id),
+        dbGet("predictions", "?matchday_id=eq." + viewMd.id + "&select=id,user_id,prediction_text,submitted_at,updated_at,score")
+      ]);
+      setViewData({ matches: ms, preds: preds || [] });
+      setLoadingView(false);
+    })();
+  }, [viewMd && viewMd.id]);
+
+  const isFrozen = openMd && openMd.is_frozen;
+  const isComplete = openMd && openMd.is_completed;
+  const canEdit = !user.is_admin && openMd && openMd.is_open && !isFrozen && !isComplete;
+  const totalPicks = matches.filter(m => picks[m.id]).length;
+  const allPicked = matches.length > 0 && totalPicks === matches.length;
+  const predText = buildText(picks, matches);
+  const hasChanged = savedPred ? predText !== savedPred.prediction_text : allPicked;
+  const submittedIds = new Set(allPreds.map(p => p.user_id));
+
+  async function handleSave() {
+    if (!canEdit || !allPicked) return;
+    setSaveState("saving"); setSaveErr("");
+    try {
+      const existing = await dbGet("predictions", "?user_id=eq." + user.id + "&matchday_id=eq." + openMd.id);
+      let result;
+      if (existing && existing.length) {
+        if (existing[0].is_locked) throw new Error("Previsione bloccata");
+        result = await dbPatch("predictions", "?user_id=eq." + user.id + "&matchday_id=eq." + openMd.id, { prediction_text: predText });
+      } else {
+        result = await dbPost("predictions", { user_id: user.id, matchday_id: openMd.id, prediction_text: predText });
+      }
+      setSavedPred(result[0]);
+      setSaveState("saved");
+      const preds = await dbGet("predictions", "?matchday_id=eq." + openMd.id + "&select=id,user_id,prediction_text,submitted_at,updated_at,score");
+      setAllPreds(preds || []);
+    } catch(e) {
+      setSaveState("error"); setSaveErr(e.message || "Errore");
+    }
+  }
+
+  if (loading) return React.createElement("div", { style: { display: "flex", justifyContent: "center", alignItems: "center", minHeight: "60vh" } }, React.createElement(Spin, { size: 36 }));
+
+  return React.createElement("div", null,
+    // Title
+    React.createElement("div", { style: { marginBottom: 24 } },
+      React.createElement("h1", { style: { fontSize: 26, fontWeight: 800, color: "#1a1a2e", marginBottom: 2 } }, "Ciao, " + user.display_name + " \uD83D\uDC4B"),
+      React.createElement("p", { style: { color: "#888", fontSize: 14 } }, openMd ? ("Giornata " + openMd.number + (isFrozen ? " — \uD83E\uDDCA Congelata" : " — Aperta")) : "Nessuna giornata attiva")
+    ),
+
+    // Main grid
+    React.createElement("div", { className: "two-col", style: { display: "grid", gridTemplateColumns: "1fr 300px", gap: 20, marginBottom: 24, alignItems: "start" } },
+
+      // LEFT: prediction form or status
+      React.createElement("div", null,
+        !openMd && React.createElement(Card, null, React.createElement(Alert, { type: "info" }, "Nessuna giornata aperta al momento.")),
+
+        openMd && user.is_admin && React.createElement(Card, null, React.createElement(Alert, { type: "info" }, "Gli admin non inviano previsioni. Usa il pannello Admin.")),
+
+        openMd && !user.is_admin && isFrozen && React.createElement(Card, null,
+          React.createElement("div", { style: { fontSize: 18 } }, "\uD83E\uDDCA Giornata " + openMd.number + " congelata"),
+          React.createElement("p", { style: { color: "#666", fontSize: 13, marginTop: 6 } }, "Una partita rinviata. L'admin riaprira' presto."),
+          savedPred && React.createElement("div", { style: { marginTop: 12 } }, React.createElement(Alert, { type: "success" }, "Previsione salvata prima del congelamento"))
+        ),
+
+        openMd && !user.is_admin && !isFrozen && React.createElement(Card, null,
+          React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 } },
+            React.createElement("div", { style: { fontWeight: 700, fontSize: 17, color: "#1a1a2e" } }, "G" + openMd.number + " — Il tuo pronostico"),
+            React.createElement("div", { style: { display: "flex", gap: 6 } },
+              saveState === "saved" && !hasChanged && React.createElement(Badge, { color: "green" }, "Salvato"),
+              saveState === "error" && React.createElement(Badge, { color: "red" }, "Errore"),
+              saveState === "idle" && allPicked && React.createElement(Badge, { color: "blue" }, "Pronto"),
+              saveState === "idle" && !allPicked && React.createElement(Badge, { color: "amber" }, (totalPicks + "/" + matches.length))
+            )
+          ),
+          saveState === "saved" && !hasChanged && React.createElement("div", { style: { marginBottom: 12 } },
+            React.createElement(Alert, { type: "success" }, "Previsione salvata il " + new Date(savedPred.updated_at).toLocaleString("it-IT"))
+          ),
+          saveState === "error" && React.createElement("div", { style: { marginBottom: 12 } }, React.createElement(Alert, { type: "error" }, saveErr)),
+          loadingMatches
+            ? React.createElement("div", { style: { display: "flex", justifyContent: "center", padding: 24 } }, React.createElement(Spin, null))
+            : React.createElement("div", null,
+                React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8, marginBottom: 16 } },
+                  matches.map(m => {
+                    const pick = picks[m.id];
+                    return React.createElement("div", { key: m.id, style: { display: "grid", gridTemplateColumns: "1fr auto 1fr", alignItems: "center", gap: 8, padding: "10px 12px", borderRadius: 10, background: pick ? "#f7f8ff" : "#fafafa", border: pick ? "1.5px solid #c7d2fe" : "1.5px solid #f0f0f0" } },
+                      React.createElement("div", { style: { fontWeight: 700, fontSize: 13, color: "#1a1a2e", textAlign: "right", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, m.home_name),
+                      React.createElement("div", { style: { display: "flex", gap: 5, flexShrink: 0 } },
+                        ["1","X","2"].map(v => React.createElement(PickBtn, { key: v, value: v, selected: pick === v, disabled: !canEdit, onPick: () => { if (!canEdit) return; setPicks(p => ({ ...p, [m.id]: v })); if (saveState === "saved") setSaveState("idle"); } }))
+                      ),
+                      React.createElement("div", { style: { fontWeight: 700, fontSize: 13, color: "#1a1a2e", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, m.away_name)
+                    );
+                  })
+                ),
+                React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center" } },
+                  React.createElement("span", { style: { fontSize: 13, color: allPicked ? "#10b981" : "#f59e0b", fontWeight: 500 } }, allPicked ? "Tutte selezionate" : (totalPicks + "/" + matches.length + " selezionate")),
+                  canEdit && React.createElement("div", { style: { display: "flex", gap: 8 } },
+                    savedPred && saveState !== "saved" && React.createElement(Btn, { color: "secondary", small: true, onClick: () => { setPicks(parseText(savedPred.prediction_text, matches)); setSaveState("saved"); } }, "Annulla"),
+                    React.createElement(Btn, { onClick: handleSave, disabled: !allPicked || saveState === "saving", small: true },
+                      saveState === "saving" ? React.createElement(Spin, { size: 14 }) : "Salva"
+                    )
+                  )
+                )
+              )
+        )
+      ),
+
+      // RIGHT: submission status
+      React.createElement("div", null,
+        openMd && React.createElement(Card, null,
+          React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#888", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 12 } }, "Chi ha inviato — G" + openMd.number),
+          React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 6 } },
+            allUsers.map(u => {
+              const submitted = submittedIds.has(u.id);
+              const pred = allPreds.find(p => p.user_id === u.id);
+              return React.createElement("div", { key: u.id, style: { display: "flex", alignItems: "center", gap: 8, padding: "6px 8px", borderRadius: 8, background: submitted ? "#f0fdf4" : "#fef2f2" } },
+                React.createElement("div", { style: { width: 8, height: 8, borderRadius: "50%", background: submitted ? "#10b981" : "#ef4444", flexShrink: 0 } }),
+                React.createElement("span", { style: { fontSize: 13, fontWeight: 500, color: "#1a1a2e", flex: 1 } }, u.display_name),
+                submitted && pred && React.createElement("span", { style: { fontSize: 10, color: "#aaa" } }, new Date(pred.submitted_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }))
+              );
+            })
+          )
+        )
+      )
+    ),
+
+    // All predictions for open matchday — always visible
+    openMd && !loadingMatches && matches.length > 0 && React.createElement(Card, { style: { marginBottom: 20 } },
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 } },
+        React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#888", letterSpacing: "0.08em", textTransform: "uppercase" } }, "Pronostici di tutti — G" + openMd.number),
+        React.createElement(Badge, { color: "green" }, "Sempre visibili")
+      ),
+      React.createElement("div", { style: { display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 10 } },
+        allUsers.map((u, uIdx) => {
+          const pred = allPreds.find(p => p.user_id === u.id);
+          const userPicks = pred ? parseText(pred.prediction_text, matches) : {};
+          const isMe = u.id === user.id;
+          return React.createElement("div", { key: u.id, style: { borderRadius: 10, overflow: "hidden", border: isMe ? "2px solid #667eea" : "1px solid #e8e8e8", background: "#fff" } },
+            // Card header
+            React.createElement("div", { style: { padding: "9px 12px", background: isMe ? "linear-gradient(135deg, #667eea15, #764ba215)" : "#fafafa", borderBottom: "1px solid #f0f0f0", display: "flex", alignItems: "center", gap: 8 } },
+              React.createElement("div", { style: { width: 28, height: 28, borderRadius: "50%", background: "hsl(" + (uIdx * 36) + ",55%,55%)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, color: "#fff", flexShrink: 0 } }, u.display_name[0]),
+              React.createElement("div", { style: { flex: 1, minWidth: 0 } },
+                React.createElement("div", { style: { fontWeight: 700, fontSize: 13, color: "#1a1a2e", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } },
+                  u.display_name, isMe && React.createElement("span", { style: { color: "#667eea", fontSize: 10, marginLeft: 5 } }, "tu")
+                ),
+                pred
+                  ? React.createElement("div", { style: { fontSize: 10, color: "#aaa" } }, new Date(pred.submitted_at).toLocaleString("it-IT"))
+                  : React.createElement("div", { style: { fontSize: 10, color: "#ef4444" } }, "Non inviato")
+              ),
+              pred && pred.score != null && React.createElement(Badge, { color: "purple" }, "\u2B50 " + Number(pred.score).toFixed(1))
+            ),
+            // Picks
+            pred && React.createElement("div", { style: { padding: "8px 10px", display: "flex", flexDirection: "column", gap: 4 } },
+              matches.map(m => {
+                const pick = userPicks[m.id];
+                const correct = m.is_played && pick && pick === m.result;
+                const wrong = m.is_played && pick && pick !== m.result;
+                return React.createElement("div", { key: m.id, style: { display: "grid", gridTemplateColumns: "1fr 26px 1fr 20px", alignItems: "center", gap: 4, padding: "3px 6px", borderRadius: 6, fontSize: 11, background: correct ? "#f0fdf4" : wrong ? "#fef2f2" : "#fafafa" } },
+                  React.createElement("div", { style: { fontWeight: 600, color: "#333", textAlign: "right", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, m.home_name),
+                  React.createElement("div", { style: { display: "flex", justifyContent: "center" } },
+                    pick
+                      ? React.createElement("span", { style: { display: "inline-flex", alignItems: "center", justifyContent: "center", width: 22, height: 22, borderRadius: 5, fontSize: 11, fontWeight: 800, background: correct ? "#dcfce7" : wrong ? "#fee2e2" : "#f0f4ff", color: correct ? "#16a34a" : wrong ? "#dc2626" : "#4338ca", border: "1px solid " + (correct ? "#bbf7d0" : wrong ? "#fecaca" : "#c7d2fe") } }, pick)
+                      : React.createElement("span", { style: { color: "#ddd", fontSize: 14 } }, "?")
+                  ),
+                  React.createElement("div", { style: { fontWeight: 600, color: "#333", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, m.away_name),
+                  m.is_played ? React.createElement(ResultPill, { result: m.result }) : null
+                );
+              })
+            ),
+            !pred && React.createElement("div", { style: { padding: "10px 12px", color: "#ef4444", fontSize: 12 } }, "Nessuna previsione inviata")
+          );
+        })
+      )
+    ),
+
+    // Season timeline
+    React.createElement(Card, { style: { marginBottom: 20 } },
+      React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#888", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 12 } },
+        "Stagione — " + allMds.filter(m => m.is_completed).length + "/38 completate"
+      ),
+      React.createElement("div", { className: "md-grid", style: { display: "grid", gridTemplateColumns: "repeat(10, 1fr)", gap: 5 } },
+        allMds.map(md => {
+          const st = mdStatus(md);
+          const isCurr = openMd && openMd.id === md.id;
+          const isSelected = viewMd && viewMd.id === md.id;
+          return React.createElement("div", { key: md.id, onClick: () => setViewMd(viewMd && viewMd.id === md.id ? null : md), style: { padding: "6px 2px", borderRadius: 7, textAlign: "center", cursor: "pointer", border: isCurr ? "2px solid #667eea" : isSelected ? "2px solid #764ba2" : "1px solid #e8e8e8", background: st.bg, transition: "all 0.1s" } },
+            React.createElement("div", { style: { width: 7, height: 7, borderRadius: "50%", background: st.dot, margin: "0 auto 3px" } }),
+            React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: isCurr ? "#667eea" : "#1a1a2e" } }, "G" + md.number),
+            React.createElement("div", { style: { fontSize: 8, color: st.dot, fontWeight: 600 } }, st.label)
+          );
+        })
+      ),
+      React.createElement("div", { style: { display: "flex", gap: 14, marginTop: 12, flexWrap: "wrap" } },
+        [["#10b981","Completata"],["#f59e0b","Aperta"],["#1565c0","Congelata"],["#d1d5db","In arrivo"]].map(([dot, label]) =>
+          React.createElement("div", { key: label, style: { display: "flex", alignItems: "center", gap: 5, fontSize: 11, color: "#888" } },
+            React.createElement("div", { style: { width: 7, height: 7, borderRadius: "50%", background: dot } }), label
+          )
+        )
+      )
+    ),
+
+    // Viewer for selected matchday
+    viewMd && React.createElement(Card, null,
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 } },
+        React.createElement("div", { style: { fontSize: 18, fontWeight: 700, color: "#1a1a2e" } }, "Giornata " + viewMd.number + " — " + mdStatus(viewMd).label),
+        React.createElement("button", { onClick: () => setViewMd(null), style: { background: "none", border: "none", cursor: "pointer", fontSize: 20, color: "#aaa" } }, "\u2715")
+      ),
+      loadingView
+        ? React.createElement("div", { style: { display: "flex", justifyContent: "center", padding: 24 } }, React.createElement(Spin, null))
+        : React.createElement("div", { className: "two-col", style: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 } },
+            // Matches
+            React.createElement("div", null,
+              React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#888", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 10 } }, "Partite"),
+              React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 6 } },
+                viewData.matches.length === 0 && React.createElement("div", { style: { color: "#ccc", fontSize: 13 } }, "Nessuna partita"),
+                viewData.matches.map(m =>
+                  React.createElement("div", { key: m.id, style: { display: "grid", gridTemplateColumns: "1fr auto 1fr", alignItems: "center", gap: 6, padding: "8px 10px", background: "#fafafa", borderRadius: 8, border: "1px solid #f0f0f0", fontSize: 12 } },
+                    React.createElement("div", { style: { fontWeight: 600, textAlign: "right", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, m.home_name),
+                    React.createElement("div", { style: { textAlign: "center", minWidth: 70 } },
+                      m.is_played
+                        ? React.createElement("span", { style: { fontWeight: 800, fontSize: 15 } }, m.home_goals + " – " + m.away_goals + " ")
+                        : React.createElement("span", { style: { color: "#ccc" } }, "vs"),
+                      m.is_played && React.createElement(ResultPill, { result: m.result })
+                    ),
+                    React.createElement("div", { style: { fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, m.away_name)
+                  )
+                )
+              )
+            ),
+            // Predictions
+            React.createElement("div", null,
+              React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#888", letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 10 } }, "Pronostici (" + viewData.preds.length + "/" + allUsers.length + ")"),
+              React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 5 } },
+                allUsers.map((u, uIdx) => {
+                  const pred = viewData.preds.find(p => p.user_id === u.id);
+                  const userPicks = pred ? parseText(pred.prediction_text, viewData.matches) : {};
+                  const isMe = u.id === user.id;
+                  return React.createElement("div", { key: u.id, style: { padding: "8px 10px", borderRadius: 8, background: isMe ? "#f7f8ff" : "#fafafa", border: isMe ? "1px solid #c7d2fe" : "1px solid #f0f0f0" } },
+                    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 6, marginBottom: pred ? 6 : 0 } },
+                      React.createElement("div", { style: { width: 7, height: 7, borderRadius: "50%", background: pred ? "#10b981" : "#ef4444" } }),
+                      React.createElement("span", { style: { fontWeight: 600, fontSize: 12, color: "#1a1a2e" } }, u.display_name),
+                      pred && pred.score != null && React.createElement(Badge, { color: "purple" }, "\u2B50 " + Number(pred.score).toFixed(1)),
+                      pred && React.createElement("span", { style: { fontSize: 10, color: "#aaa", marginLeft: "auto" } }, new Date(pred.submitted_at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }))
+                    ),
+                    pred && viewData.matches.length > 0 && React.createElement("div", { style: { display: "flex", gap: 3, flexWrap: "wrap" } },
+                      viewData.matches.map(m => {
+                        const pick = userPicks[m.id];
+                        const correct = m.is_played && pick && pick === m.result;
+                        const wrong = m.is_played && pick && pick !== m.result;
+                        return React.createElement("span", { key: m.id, title: m.home_name + " vs " + m.away_name, style: { padding: "2px 6px", borderRadius: 5, fontSize: 11, fontWeight: 700, background: correct ? "#dcfce7" : wrong ? "#fee2e2" : pick ? "#f0f4ff" : "#f5f5f5", color: correct ? "#16a34a" : wrong ? "#dc2626" : pick ? "#4338ca" : "#aaa", border: "1px solid " + (correct ? "#bbf7d0" : wrong ? "#fecaca" : pick ? "#c7d2fe" : "#e5e7eb") } }, pick || "?");
+                      })
+                    ),
+                    !pred && React.createElement("div", { style: { fontSize: 11, color: "#ef4444" } }, "Non inviato")
+                  );
+                })
+              )
+            )
+          )
+    )
+  );
+}
+
+// ── Standings ─────────────────────────────────────────────────────────────────
+function StandingsPage({ user }) {
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    (async () => {
+      const users = await dbGet("league_users", "?is_admin=eq.false&select=id,display_name,username&order=display_name.asc");
+      const preds = await dbGet("predictions", "?select=user_id,score");
+      const map = {};
+      (users || []).forEach(u => { map[u.id] = { ...u, total: 0, count: 0 }; });
+      (preds || []).forEach(p => { if (map[p.user_id] && p.score != null) { map[p.user_id].total += Number(p.score); map[p.user_id].count++; } });
+      const sorted = Object.values(map).sort((a, b) => b.total - a.total);
+      setRows(sorted); setLoading(false);
+    })();
+  }, []);
+  if (loading) return React.createElement("div", { style: { display: "flex", justifyContent: "center", padding: 60 } }, React.createElement(Spin, { size: 40 }));
+  const medals = ["\uD83E\uDD47","\uD83E\uDD48","\uD83E\uDD49"];
+  return React.createElement("div", null,
+    React.createElement("h1", { style: { fontSize: 26, fontWeight: 800, color: "#1a1a2e", marginBottom: 4 } }, "Classifica"),
+    React.createElement("p", { style: { color: "#888", fontSize: 14, marginBottom: 24 } }, "Punti accumulati in stagione"),
+    React.createElement(Card, null,
+      rows.map((r, i) =>
+        React.createElement("div", { key: r.id, style: { display: "flex", alignItems: "center", gap: 14, padding: "14px 0", borderBottom: i < rows.length - 1 ? "1px solid #f5f5f5" : "none" } },
+          React.createElement("div", { style: { width: 32, textAlign: "center", fontSize: i < 3 ? 20 : 14, fontWeight: 700, color: i < 3 ? "#1a1a2e" : "#aaa" } }, i < 3 ? medals[i] : (i + 1)),
+          React.createElement("div", { style: { flex: 1 } },
+            React.createElement("div", { style: { fontWeight: 700, fontSize: 15, color: r.id === user.id ? "#667eea" : "#1a1a2e" } }, r.display_name + (r.id === user.id ? " (tu)" : "")),
+            React.createElement("div", { style: { fontSize: 12, color: "#aaa" } }, r.count + " giornate con punteggio")
+          ),
+          React.createElement("div", { style: { fontWeight: 800, fontSize: 20, color: "#667eea" } }, r.total.toFixed(1))
+        )
+      )
+    )
+  );
+}
+
+// ── History ───────────────────────────────────────────────────────────────────
+function HistoryPage({ user }) {
+  const [mds, setMds] = useState([]);
+  const [selMd, setSelMd] = useState(null);
+  const [matches, setMatches] = useState([]);
+  const [pred, setPred] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const data = await dbGet("matchdays", "?is_completed=eq.true&order=number.desc&select=id,number,is_completed,is_frozen,is_open");
+      setMds(data || []); setLoading(false);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!selMd) return;
+    setLoadingDetail(true);
+    (async () => {
+      const [ms, myP] = await Promise.all([
+        loadMatches(selMd.id),
+        dbGet("predictions", "?matchday_id=eq." + selMd.id + "&user_id=eq." + user.id)
+      ]);
+      setMatches(ms); setPred(myP && myP.length ? myP[0] : null); setLoadingDetail(false);
+    })();
+  }, [selMd && selMd.id]);
+
+  if (loading) return React.createElement("div", { style: { display: "flex", justifyContent: "center", padding: 60 } }, React.createElement(Spin, { size: 40 }));
+
+  const myPicks = pred && matches.length ? parseText(pred.prediction_text, matches) : {};
+  const correct = matches.filter(m => m.is_played && myPicks[m.id] && myPicks[m.id] === m.result).length;
+  const wrong = matches.filter(m => m.is_played && myPicks[m.id] && myPicks[m.id] !== m.result).length;
+
+  return React.createElement("div", null,
+    React.createElement("h1", { style: { fontSize: 26, fontWeight: 800, color: "#1a1a2e", marginBottom: 4 } }, "Storico"),
+    React.createElement("p", { style: { color: "#888", fontSize: 14, marginBottom: 20 } }, "I tuoi pronostici per le giornate completate"),
+    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 20 } },
+      React.createElement("span", { style: { fontSize: 14, fontWeight: 600, color: "#666" } }, "Giornata:"),
+      React.createElement("select", { value: selMd ? selMd.id : "", onChange: e => setSelMd(mds.find(m => m.id === e.target.value) || null), style: { padding: "9px 14px", border: "1.5px solid #e0e0e0", borderRadius: 8, fontSize: 14, fontFamily: "inherit", outline: "none", background: "#fff", cursor: "pointer" } },
+        React.createElement("option", { value: "" }, "Seleziona giornata..."),
+        mds.map(m => React.createElement("option", { key: m.id, value: m.id }, "G" + m.number))
+      )
+    ),
+    selMd && React.createElement(Card, null,
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 } },
+        React.createElement("div", { style: { fontSize: 18, fontWeight: 700 } }, "Giornata " + selMd.number),
+        pred && pred.score != null && React.createElement(Badge, { color: "purple" }, "\u2B50 " + Number(pred.score).toFixed(1) + " pt")
+      ),
+      !pred && React.createElement("div", { style: { marginBottom: 16 } }, React.createElement(Alert, { type: "error" }, "Non hai inviato la previsione per questa giornata.")),
+      pred && correct + wrong > 0 && React.createElement("div", { style: { marginBottom: 16 } }, React.createElement(Alert, { type: correct > wrong ? "success" : "warning" }, correct + " corrette, " + wrong + " errate")),
+      loadingDetail
+        ? React.createElement("div", { style: { display: "flex", justifyContent: "center", padding: 20 } }, React.createElement(Spin, null))
+        : React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 8 } },
+            matches.map(m => {
+              const pick = myPicks[m.id];
+              const isCorrect = m.is_played && pick && pick === m.result;
+              const isWrong = m.is_played && pick && pick !== m.result;
+              return React.createElement("div", { key: m.id, style: { borderRadius: 10, overflow: "hidden", border: isCorrect ? "1.5px solid #bbf7d0" : isWrong ? "1.5px solid #fecaca" : "1.5px solid #e8e8e8", background: isCorrect ? "#f0fdf4" : isWrong ? "#fef2f2" : "#fafafa" } },
+                React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr auto 1fr", alignItems: "center", gap: 8, padding: "12px 14px" } },
+                  React.createElement("div", { style: { textAlign: "right" } },
+                    React.createElement("div", { style: { fontWeight: 700, fontSize: 14 } }, m.home_name),
+                    m.is_played && React.createElement("div", { style: { fontSize: 11, color: "#aaa", marginTop: 2 } }, "FP " + m.home_fantapunti)
+                  ),
+                  React.createElement("div", { style: { textAlign: "center" } },
+                    m.is_played ? React.createElement("div", null,
+                      React.createElement("div", { style: { fontWeight: 800, fontSize: 20 } }, m.home_goals + " – " + m.away_goals),
+                      React.createElement(ResultPill, { result: m.result })
+                    ) : React.createElement("span", { style: { color: "#ccc" } }, "vs")
+                  ),
+                  React.createElement("div", null,
+                    React.createElement("div", { style: { fontWeight: 700, fontSize: 14 } }, m.away_name),
+                    m.is_played && React.createElement("div", { style: { fontSize: 11, color: "#aaa", marginTop: 2 } }, "FP " + m.away_fantapunti)
+                  )
+                ),
+                pick && React.createElement("div", { style: { padding: "5px 14px 8px", borderTop: "1px dashed #e8e8e8", display: "flex", alignItems: "center", gap: 8, fontSize: 12 } },
+                  React.createElement("span", { style: { color: "#888" } }, "Il tuo pronostico:"),
+                  React.createElement(ResultPill, { result: pick }),
+                  isCorrect && React.createElement("span", { style: { color: "#10b981", fontWeight: 700 } }, "\u2713 Corretto!"),
+                  isWrong && React.createElement("span", { style: { color: "#ef4444", fontWeight: 700 } }, "\u2717 Errato"),
+                  !m.is_played && React.createElement("span", { style: { color: "#aaa" } }, "In attesa")
+                )
+              );
+            })
+          )
+    )
+  );
+}
+
+// ── Calendar ──────────────────────────────────────────────────────────────────
+function CalendarPage({ user }) {
+  const [mds, setMds] = useState([]);
+  const [allUsers, setAllUsers] = useState([]);
+  const [selMd, setSelMd] = useState(null);
+  const [matches, setMatches] = useState([]);
+  const [allPreds, setAllPreds] = useState([]);
+  const [myPreds, setMyPreds] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const [mdsData, users, myP] = await Promise.all([
+        dbGet("matchdays", "?order=number.asc&select=id,number,is_completed,is_frozen,is_open"),
+        dbGet("league_users", "?is_admin=eq.false&select=id,display_name,username&order=display_name.asc"),
+        dbGet("predictions", "?user_id=eq." + user.id + "&select=matchday_id,prediction_text,score,submitted_at,updated_at")
+      ]);
+      const pm = {};
+      (myP || []).forEach(p => { pm[p.matchday_id] = p; });
+      setMds(mdsData || []); setAllUsers(users || []); setMyPreds(pm);
+      const open = (mdsData || []).find(m => m.is_open);
+      const completed = (mdsData || []).filter(m => m.is_completed);
+      setSelMd(open || completed[completed.length - 1] || (mdsData || [])[0] || null);
+      setLoading(false);
+    })();
+  }, [user.id]);
+
+  useEffect(() => {
+    if (!selMd) return;
+    setLoadingDetail(true);
+    setMatches([]); setAllPreds([]);
+    (async () => {
+      const [ms, preds] = await Promise.all([
+        loadMatches(selMd.id),
+        dbGet("predictions", "?matchday_id=eq." + selMd.id + "&select=id,user_id,prediction_text,submitted_at,score")
+      ]);
+      setMatches(ms); setAllPreds(preds || []); setLoadingDetail(false);
+    })();
+  }, [selMd && selMd.id]);
+
+  if (loading) return React.createElement("div", { style: { display: "flex", justifyContent: "center", padding: 60 } }, React.createElement(Spin, { size: 40 }));
+
+  const myPred = myPreds[selMd && selMd.id];
+  const myPickMap = myPred && matches.length ? parseText(myPred.prediction_text, matches) : {};
+
+  return React.createElement("div", null,
+    React.createElement("h1", { style: { fontSize: 26, fontWeight: 800, color: "#1a1a2e", marginBottom: 4 } }, "Calendario"),
+    React.createElement("p", { style: { color: "#888", fontSize: 14, marginBottom: 20 } }, "Tutte le partite della stagione"),
+    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 20 } },
+      React.createElement("span", { style: { fontSize: 14, fontWeight: 600, color: "#666" } }, "Giornata:"),
+      React.createElement("select", { value: selMd ? selMd.id : "", onChange: e => setSelMd(mds.find(m => m.id === e.target.value) || null), style: { padding: "9px 14px", border: "1.5px solid #e0e0e0", borderRadius: 8, fontSize: 14, fontFamily: "inherit", outline: "none", background: "#fff", cursor: "pointer", minWidth: 140 } },
+        mds.map(m => {
+          const tag = m.is_completed ? " \u2713" : m.is_open ? " \uD83D\uDCC2" : m.is_frozen ? " \uD83E\uDDCA" : " \u23F3";
+          return React.createElement("option", { key: m.id, value: m.id }, "G" + m.number + tag);
+        })
+      ),
+      selMd && React.createElement(Badge, { color: mdStatus(selMd).badge }, mdStatus(selMd).label),
+      myPred && myPred.score != null && React.createElement(Badge, { color: "purple" }, "\u2B50 " + Number(myPred.score).toFixed(1) + " pt")
+    ),
+    selMd && (
+      loadingDetail
+        ? React.createElement("div", { style: { display: "flex", justifyContent: "center", padding: 40 } }, React.createElement(Spin, { size: 32 }))
+        : React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 10 } },
+            matches.map(m => {
+              const myPick = myPickMap[m.id];
+              const correct = m.is_played && myPick && myPick === m.result;
+              const wrong = m.is_played && myPick && myPick !== m.result;
+              return React.createElement(Card, { key: m.id, style: { padding: 0, overflow: "hidden", border: correct ? "1.5px solid #bbf7d0" : wrong ? "1.5px solid #fecaca" : "1.5px solid #e8e8e8", background: correct ? "#f0fdf4" : wrong ? "#fef2f2" : "#fff" } },
+                React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr auto 1fr", alignItems: "center", gap: 8, padding: "14px 18px" } },
+                  React.createElement("div", { style: { textAlign: "right" } },
+                    React.createElement("div", { style: { fontWeight: 700, fontSize: 15 } }, m.home_name),
+                    m.is_played && React.createElement("div", { style: { fontSize: 11, color: "#aaa", marginTop: 2 } }, "FP " + m.home_fantapunti)
+                  ),
+                  React.createElement("div", { style: { textAlign: "center", minWidth: 90 } },
+                    m.is_played ? React.createElement("div", null,
+                      React.createElement("div", { style: { fontWeight: 800, fontSize: 24, lineHeight: 1 } }, m.home_goals + " \u2013 " + m.away_goals),
+                      React.createElement("div", { style: { marginTop: 4 } }, React.createElement(ResultPill, { result: m.result }))
+                    ) : React.createElement("div", { style: { color: "#ccc", fontWeight: 600 } }, "vs")
+                  ),
+                  React.createElement("div", null,
+                    React.createElement("div", { style: { fontWeight: 700, fontSize: 15 } }, m.away_name),
+                    m.is_played && React.createElement("div", { style: { fontSize: 11, color: "#aaa", marginTop: 2 } }, "FP " + m.away_fantapunti)
+                  )
+                ),
+                myPick && React.createElement("div", { style: { padding: "6px 18px 10px", borderTop: "1px dashed #e8e8e8", display: "flex", alignItems: "center", gap: 8, fontSize: 12 } },
+                  React.createElement("span", { style: { color: "#888" } }, "Il tuo pronostico:"),
+                  React.createElement(ResultPill, { result: myPick }),
+                  correct && React.createElement("span", { style: { color: "#10b981", fontWeight: 700 } }, "\u2713 Corretto!"),
+                  wrong && React.createElement("span", { style: { color: "#ef4444", fontWeight: 700 } }, "\u2717 Errato"),
+                  !m.is_played && React.createElement("span", { style: { color: "#aaa" } }, "In attesa")
+                ),
+                selMd.is_completed && allUsers.length > 0 && React.createElement("div", { style: { padding: "6px 18px 10px", borderTop: "1px dashed #e8e8e8" } },
+                  React.createElement("div", { style: { fontSize: 10, fontWeight: 700, color: "#bbb", letterSpacing: "0.06em", textTransform: "uppercase", marginBottom: 5 } }, "Tutti"),
+                  React.createElement("div", { style: { display: "flex", flexWrap: "wrap", gap: 5 } },
+                    allUsers.map(u => {
+                      const p = allPreds.find(pr => pr.user_id === u.id);
+                      const uPicks = p ? parseText(p.prediction_text, matches) : {};
+                      const pick = uPicks[m.id];
+                      const uCorrect = m.is_played && pick && pick === m.result;
+                      const uWrong = m.is_played && pick && pick !== m.result;
+                      return React.createElement("div", { key: u.id, title: u.display_name, style: { display: "flex", alignItems: "center", gap: 3, padding: "2px 7px", borderRadius: 20, fontSize: 11, background: uCorrect ? "#dcfce7" : uWrong ? "#fee2e2" : pick ? "#f0f4ff" : "#f5f5f5", border: "1px solid " + (uCorrect ? "#bbf7d0" : uWrong ? "#fecaca" : pick ? "#c7d2fe" : "#e5e7eb"), color: uCorrect ? "#16a34a" : uWrong ? "#dc2626" : pick ? "#4338ca" : "#aaa" } },
+                        React.createElement("span", { style: { fontWeight: 700 } }, u.display_name.split(" ")[0]),
+                        React.createElement("span", { style: { fontWeight: 800 } }, pick || "\u2014")
+                      );
+                    })
+                  )
+                )
+              );
+            }),
+            matches.length === 0 && React.createElement("div", { style: { textAlign: "center", padding: 40, color: "#bbb" } }, "Nessuna partita per questa giornata")
+          )
+    )
+  );
+}
+
+// ── Admin ─────────────────────────────────────────────────────────────────────
+function AdminPage({ user }) {
+  const [tab, setTab] = useState("overview");
+  const [mds, setMds] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [selMd, setSelMd] = useState(null);
+  const [subs, setSubs] = useState([]);
+  const [scores, setScores] = useState({});
+  const [scoreNotes, setScoreNotes] = useState({});
+  const [savingScore, setSavingScore] = useState({});
+  const [audit, setAudit] = useState([]);
+  const [passwords, setPasswords] = useState({});
+  const [pwResult, setPwResult] = useState({});
+  const [matchRes, setMatchRes] = useState([]);
+  const [resEdits, setResEdits] = useState({});
+  const [savingRes, setSavingRes] = useState({});
+  const [resSaved, setResSaved] = useState({});
+  const [autoCompleted, setAutoCompleted] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      const [mdsData, usrs] = await Promise.all([
+        dbGet("matchdays", "?order=number.asc&select=id,number,is_completed,is_frozen,is_open"),
+        dbGet("league_users", "?is_admin=eq.false&select=id,username,display_name&order=display_name.asc")
+      ]);
+      setMds(mdsData || []); setUsers(usrs || []);
+      const cur = (mdsData || []).find(m => m.is_open) || (mdsData || []).find(m => !m.is_completed) || (mdsData || [])[mdsData.length - 1];
+      setSelMd(cur || null); setLoading(false);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!selMd || (tab !== "overview" && tab !== "scores")) return;
+    (async () => {
+      const data = await dbGet("predictions", "?matchday_id=eq." + selMd.id + "&select=id,prediction_text,submitted_at,updated_at,is_locked,score,score_notes,user_id,league_users(display_name,username)&order=submitted_at.asc");
+      setSubs(data || []);
+      const sc = {}; const sn = {};
+      (data || []).forEach(s => { sc[s.id] = s.score != null ? String(s.score) : ""; sn[s.id] = s.score_notes || ""; });
+      setScores(sc); setScoreNotes(sn);
+    })();
+  }, [selMd && selMd.id, tab]);
+
+  useEffect(() => {
+    if (!selMd || tab !== "risultati") return;
+    setAutoCompleted(false);
+    (async () => {
+      const ms = await loadMatches(selMd.id);
+      setMatchRes(ms);
+      const edits = {};
+      ms.forEach(m => { edits[m.id] = { home_goals: m.home_goals != null ? String(m.home_goals) : "", away_goals: m.away_goals != null ? String(m.away_goals) : "", home_fp: m.home_fantapunti != null ? String(m.home_fantapunti) : "", away_fp: m.away_fantapunti != null ? String(m.away_fantapunti) : "", result: m.result || "" }; });
+      setResEdits(edits);
+    })();
+  }, [selMd && selMd.id, tab]);
+
+  useEffect(() => {
+    if (tab !== "audit") return;
+    (async () => {
+      const data = await dbGet("submission_audit_log", "?order=logged_at.desc&limit=100&select=*,league_users(display_name),matchdays(number)");
+      setAudit(data || []);
+    })();
+  }, [tab]);
+
+  async function saveMatchResult(matchId) {
+    const e = resEdits[matchId];
+    if (!e) return;
+    const hg = parseInt(e.home_goals); const ag = parseInt(e.away_goals);
+    let res = e.result;
+    if (!res && e.home_goals !== "" && e.away_goals !== "") res = hg > ag ? "1" : ag > hg ? "2" : "X";
+    const payload = { home_goals: e.home_goals !== "" ? hg : null, away_goals: e.away_goals !== "" ? ag : null, home_fantapunti: e.home_fp !== "" ? parseFloat(e.home_fp) : null, away_fantapunti: e.away_fp !== "" ? parseFloat(e.away_fp) : null, result: res || null, is_played: e.home_goals !== "" && e.away_goals !== "" };
+    setSavingRes(s => ({ ...s, [matchId]: true }));
+    try {
+      await dbPatch("matches", "?id=eq." + matchId, payload);
+      setMatchRes(ms => ms.map(m => m.id === matchId ? { ...m, ...payload } : m));
+      setResEdits(ed => ({ ...ed, [matchId]: { ...ed[matchId], result: res } }));
+      setResSaved(s => ({ ...s, [matchId]: true }));
+      setTimeout(() => setResSaved(s => ({ ...s, [matchId]: false })), 3000);
+      const updated = matchRes.map(m => m.id === matchId ? { ...m, ...payload } : m);
+      const allDone = updated.length > 0 && updated.every(m => m.result != null && m.home_fantapunti != null && m.away_fantapunti != null);
+      if (allDone) {
+        setAutoCompleted(true);
+        const freshMds = await dbGet("matchdays", "?order=number.asc&select=id,number,is_completed,is_frozen,is_open");
+        setMds(freshMds || []);
+        const freshSel = (freshMds || []).find(m => m.id === selMd.id);
+        if (freshSel) setSelMd(freshSel);
+      }
+    } catch(err) { alert("Errore: " + err.message); }
+    setSavingRes(s => ({ ...s, [matchId]: false }));
+  }
+
+  async function saveScore(predId) {
+    setSavingScore(s => ({ ...s, [predId]: true }));
+    try {
+      const sc = scores[predId] !== "" ? parseFloat(scores[predId]) : null;
+      await dbPatch("predictions", "?id=eq." + predId, { score: sc, score_notes: scoreNotes[predId] || null });
+    } catch(err) { alert("Errore: " + err.message); }
+    setSavingScore(s => ({ ...s, [predId]: false }));
+  }
+
+  async function toggleFreeze(md) {
+    const nf = !md.is_frozen;
+    await dbPatch("matchdays", "?id=eq." + md.id, { is_frozen: nf });
+    setMds(ms => ms.map(m => m.id === md.id ? { ...m, is_frozen: nf } : m));
+    if (selMd && selMd.id === md.id) setSelMd(m => ({ ...m, is_frozen: nf }));
+  }
+
+  async function changePassword(userId) {
+    const pwd = passwords[userId];
+    if (!pwd || pwd.length < 6) { alert("Password minimo 6 caratteri"); return; }
+    setPwResult(r => ({ ...r, [userId]: "saving" }));
+    try {
+      await rpc("change_user_password", { target_user_id: userId, new_password: pwd });
+      setPwResult(r => ({ ...r, [userId]: "saved" }));
+      setPasswords(p => ({ ...p, [userId]: "" }));
+      setTimeout(() => setPwResult(r => ({ ...r, [userId]: null })), 3000);
+    } catch(err) { setPwResult(r => ({ ...r, [userId]: "error" })); alert("Errore: " + err.message); }
+  }
+
+  const missingUsers = users.filter(u => !subs.find(s => s.user_id === u.id));
+  const tabs = [{ id: "overview", label: "Previsioni" }, { id: "risultati", label: "Risultati" }, { id: "scores", label: "Punteggi" }, { id: "matchdays", label: "Giornate" }, { id: "audit", label: "Audit" }, { id: "passwords", label: "Password" }];
+
+  if (loading) return React.createElement("div", { style: { display: "flex", justifyContent: "center", padding: 60 } }, React.createElement(Spin, { size: 40 }));
+
+  return React.createElement("div", null,
+    React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 4 } },
+      React.createElement("h1", { style: { fontSize: 26, fontWeight: 800, color: "#1a1a2e" } }, "Admin Panel"),
+      React.createElement(Badge, { color: "red" }, "Admin")
+    ),
+    React.createElement("p", { style: { color: "#888", fontSize: 14, marginBottom: 24 } }, "Gestione completa della lega"),
+
+    // Tabs
+    React.createElement("div", { style: { display: "flex", gap: 2, borderBottom: "2px solid #f0f0f0", marginBottom: 24, overflowX: "auto" } },
+      tabs.map(t => React.createElement("button", { key: t.id, onClick: () => setTab(t.id), style: { padding: "10px 16px", border: "none", background: "none", cursor: "pointer", fontSize: 14, fontWeight: tab === t.id ? 700 : 400, color: tab === t.id ? "#667eea" : "#888", borderBottom: tab === t.id ? "2px solid #667eea" : "2px solid transparent", marginBottom: -2, fontFamily: "inherit", whiteSpace: "nowrap" } }, t.label))
+    ),
+
+    // Matchday selector for relevant tabs
+    (tab === "overview" || tab === "risultati" || tab === "scores") && React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 12, marginBottom: 20, flexWrap: "wrap" } },
+      React.createElement("span", { style: { fontSize: 14, color: "#888" } }, "Giornata:"),
+      React.createElement("select", { value: selMd ? selMd.id : "", onChange: e => setSelMd(mds.find(m => m.id === e.target.value) || null), style: { padding: "8px 12px", border: "1px solid #e0e0e0", borderRadius: 8, fontSize: 14, fontFamily: "inherit", outline: "none" } },
+        mds.map(m => React.createElement("option", { key: m.id, value: m.id }, "G" + m.number + (m.is_completed ? " \u2713" : m.is_frozen ? " \uD83E\uDDCA" : m.is_open ? " \uD83D\uDCC2" : " \u23F3")))
+      ),
+      selMd && !selMd.is_completed && selMd.is_open && React.createElement(Btn, { color: selMd.is_frozen ? "green" : "blue", small: true, onClick: () => toggleFreeze(selMd) }, selMd.is_frozen ? "Scongela" : "Congela")
+    ),
+
+    // Overview tab
+    tab === "overview" && selMd && React.createElement("div", null,
+      React.createElement("div", { style: { display: "flex", gap: 14, marginBottom: 20, flexWrap: "wrap" } },
+        React.createElement(Card, { style: { flex: 1, minWidth: 120 } }, React.createElement("div", { style: { fontSize: 28, fontWeight: 800, color: "#10b981" } }, subs.length), React.createElement("div", { style: { fontSize: 13, color: "#888" } }, "Inviate")),
+        React.createElement(Card, { style: { flex: 1, minWidth: 120 } }, React.createElement("div", { style: { fontSize: 28, fontWeight: 800, color: "#ef4444" } }, missingUsers.length), React.createElement("div", { style: { fontSize: 13, color: "#888" } }, "Mancanti")),
+        React.createElement(Card, { style: { flex: 1, minWidth: 120 } }, React.createElement("div", { style: { fontSize: 20, fontWeight: 800, color: "#667eea" } }, mdStatus(selMd).label), React.createElement("div", { style: { fontSize: 13, color: "#888" } }, "Stato"))
+      ),
+      missingUsers.length > 0 && React.createElement("div", { style: { marginBottom: 16 } }, React.createElement(Alert, { type: "warning" }, "Non hanno inviato: " + missingUsers.map(u => u.display_name).join(", "))),
+      React.createElement(Card, { style: { overflowX: "auto" } },
+        React.createElement("table", { style: { width: "100%", borderCollapse: "collapse" } },
+          React.createElement("thead", null,
+            React.createElement("tr", { style: { borderBottom: "2px solid #f0f0f0" } },
+              ["UTENTE","PREVISIONE","INVIATA","PUNTEGGIO","STATO","AZIONI"].map(h => React.createElement("th", { key: h, style: { textAlign: "left", padding: "8px 10px", fontSize: 11, color: "#888", fontWeight: 700 } }, h))
+            )
+          ),
+          React.createElement("tbody", null,
+            subs.map(s => React.createElement("tr", { key: s.id, style: { borderBottom: "1px solid #f5f5f5" } },
+              React.createElement("td", { style: { padding: "10px 10px" } }, React.createElement("div", { style: { fontWeight: 600, color: "#1a1a2e" } }, s.league_users && s.league_users.display_name), React.createElement("div", { style: { fontSize: 11, color: "#aaa" } }, s.league_users && s.league_users.username)),
+              React.createElement("td", { style: { padding: "10px 10px", maxWidth: 260 } }, React.createElement("div", { style: { fontSize: 11, color: "#666", fontStyle: "italic", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, '"' + s.prediction_text + '"')),
+              React.createElement("td", { style: { padding: "10px 10px", fontSize: 12, color: "#888" } }, new Date(s.submitted_at).toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })),
+              React.createElement("td", { style: { padding: "10px 10px", fontWeight: 800, color: s.score != null ? "#667eea" : "#ccc", fontSize: 16 } }, s.score != null ? Number(s.score).toFixed(1) : "—"),
+              React.createElement("td", { style: { padding: "10px 10px" } }, s.is_locked ? React.createElement(Badge, { color: "red" }, "Bloccata") : React.createElement(Badge, { color: "green" }, "Aperta")),
+              React.createElement("td", { style: { padding: "10px 10px" } }, React.createElement(Btn, { color: "secondary", small: true, onClick: async () => { await dbPatch("predictions", "?id=eq." + s.id, { is_locked: !s.is_locked }); setSubs(ss => ss.map(x => x.id === s.id ? { ...x, is_locked: !x.is_locked } : x)); } }, s.is_locked ? "Sblocca" : "Blocca"))
+            )),
+            missingUsers.map(u => React.createElement("tr", { key: u.id, style: { background: "#fff8f8", borderBottom: "1px solid #fde8e8" } },
+              React.createElement("td", { colSpan: 6, style: { padding: "10px 10px", color: "#ef4444", fontSize: 13 } }, "\u26A0 " + u.display_name + " — Nessuna previsione inviata")
+            ))
+          )
+        )
+      )
+    ),
+
+    // Risultati tab
+    tab === "risultati" && selMd && React.createElement(Card, null,
+      React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 } },
+        React.createElement("h2", { style: { margin: 0, fontSize: 18, fontWeight: 700 } }, "Risultati — G" + selMd.number),
+        autoCompleted && React.createElement(Badge, { color: "green" }, "Giornata chiusa automaticamente!")
+      ),
+      selMd.is_completed && !autoCompleted && React.createElement("div", { style: { marginBottom: 16 } }, React.createElement(Alert, { type: "info" }, "Giornata gia' completata. Puoi modificare i risultati.")),
+      React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
+        matchRes.map((m, idx) => {
+          const ed = resEdits[m.id] || {};
+          const done = m.result != null && m.home_fantapunti != null && m.away_fantapunti != null;
+          return React.createElement("div", { key: m.id, style: { border: done ? "1px solid #bbf7d0" : "1px solid #e8e8e8", borderRadius: 12, padding: "16px 18px", background: done ? "#f0fdf4" : "#fff" } },
+            React.createElement("div", { style: { display: "flex", alignItems: "center", gap: 10, marginBottom: 12 } },
+              React.createElement("span", { style: { fontWeight: 700, fontSize: 14, color: "#1a1a2e" } }, m.home_name + " vs " + m.away_name),
+              done && React.createElement(Badge, { color: "green" }, "Completata"),
+              resSaved[m.id] && React.createElement(Badge, { color: "green" }, "Salvato")
+            ),
+            React.createElement("div", { style: { display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr auto", gap: 10, alignItems: "flex-end" } },
+              React.createElement("div", null,
+                React.createElement("label", { style: { display: "block", fontSize: 11, fontWeight: 700, color: "#667eea", marginBottom: 4 } }, "GOL " + m.home_name.split(" ")[0].toUpperCase()),
+                React.createElement("input", { type: "number", min: "0", max: "20", value: ed.home_goals || "", onChange: ev => setResEdits(r => ({ ...r, [m.id]: { ...r[m.id], home_goals: ev.target.value, result: "" } })), style: { width: "100%", padding: "9px 10px", border: "1.5px solid #e0e0e0", borderRadius: 8, fontSize: 16, fontFamily: "inherit", textAlign: "center", fontWeight: 700, outline: "none" } })
+              ),
+              React.createElement("div", null,
+                React.createElement("label", { style: { display: "block", fontSize: 11, fontWeight: 700, color: "#667eea", marginBottom: 4 } }, "GOL " + m.away_name.split(" ")[0].toUpperCase()),
+                React.createElement("input", { type: "number", min: "0", max: "20", value: ed.away_goals || "", onChange: ev => setResEdits(r => ({ ...r, [m.id]: { ...r[m.id], away_goals: ev.target.value, result: "" } })), style: { width: "100%", padding: "9px 10px", border: "1.5px solid #e0e0e0", borderRadius: 8, fontSize: 16, fontFamily: "inherit", textAlign: "center", fontWeight: 700, outline: "none" } })
+              ),
+              React.createElement("div", null,
+                React.createElement("label", { style: { display: "block", fontSize: 11, fontWeight: 700, color: "#e65100", marginBottom: 4 } }, "FP " + m.home_name.split(" ")[0].toUpperCase()),
+                React.createElement("input", { type: "number", min: "0", max: "200", step: "0.5", value: ed.home_fp || "", onChange: ev => setResEdits(r => ({ ...r, [m.id]: { ...r[m.id], home_fp: ev.target.value } })), style: { width: "100%", padding: "9px 10px", border: "1.5px solid #e0e0e0", borderRadius: 8, fontSize: 16, fontFamily: "inherit", textAlign: "center", outline: "none" } })
+              ),
+              React.createElement("div", null,
+                React.createElement("label", { style: { display: "block", fontSize: 11, fontWeight: 700, color: "#e65100", marginBottom: 4 } }, "FP " + m.away_name.split(" ")[0].toUpperCase()),
+                React.createElement("input", { type: "number", min: "0", max: "200", step: "0.5", value: ed.away_fp || "", onChange: ev => setResEdits(r => ({ ...r, [m.id]: { ...r[m.id], away_fp: ev.target.value } })), style: { width: "100%", padding: "9px 10px", border: "1.5px solid #e0e0e0", borderRadius: 8, fontSize: 16, fontFamily: "inherit", textAlign: "center", outline: "none" } })
+              ),
+              React.createElement(Btn, { onClick: () => saveMatchResult(m.id), disabled: savingRes[m.id], style: { height: 44, alignSelf: "flex-end", whiteSpace: "nowrap" } },
+                savingRes[m.id] ? React.createElement(Spin, { size: 14 }) : "Salva"
+              )
+            ),
+            ed.home_goals !== "" && ed.away_goals !== "" && React.createElement("div", { style: { marginTop: 8, display: "flex", alignItems: "center", gap: 8 } },
+              React.createElement("span", { style: { fontSize: 12, color: "#888" } }, "Risultato automatico:"),
+              React.createElement(ResultPill, { result: parseInt(ed.home_goals) > parseInt(ed.away_goals) ? "1" : parseInt(ed.away_goals) > parseInt(ed.home_goals) ? "2" : "X" })
+            )
+          );
+        }),
+        matchRes.length === 0 && React.createElement(Alert, { type: "info" }, "Nessuna partita caricata per questa giornata."),
+        matchRes.length > 0 && React.createElement("div", { style: { padding: "14px 16px", background: "#f8f9fc", borderRadius: 10, border: "1px solid #e8e8e8" } },
+          React.createElement("div", { style: { display: "flex", justifyContent: "space-between", marginBottom: 8 } },
+            React.createElement("span", { style: { fontWeight: 600, fontSize: 13 } }, "Completate: " + matchRes.filter(m => m.result != null && m.home_fantapunti != null && m.away_fantapunti != null).length + "/" + matchRes.length),
+            matchRes.every(m => m.result != null && m.home_fantapunti != null && m.away_fantapunti != null)
+              ? React.createElement(Badge, { color: "green" }, "Giornata completata!")
+              : React.createElement("span", { style: { fontSize: 12, color: "#888" } }, "Salva tutti i risultati per completare la giornata")
+          ),
+          React.createElement("div", { style: { background: "#e8e8e8", borderRadius: 20, height: 6, overflow: "hidden" } },
+            React.createElement("div", { style: { width: (matchRes.filter(m => m.result != null && m.home_fantapunti != null && m.away_fantapunti != null).length / matchRes.length * 100) + "%", background: "#667eea", height: "100%", borderRadius: 20, transition: "width 0.4s" } })
+          )
+        )
+      )
+    ),
+
+    // Scores tab
+    tab === "scores" && selMd && React.createElement(Card, null,
+      React.createElement("h2", { style: { margin: "0 0 20px", fontSize: 18, fontWeight: 700 } }, "Punteggi — G" + selMd.number),
+      subs.length === 0 && React.createElement(Alert, { type: "info" }, "Nessuna previsione per questa giornata."),
+      React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 14 } },
+        subs.map(s => React.createElement("div", { key: s.id, style: { padding: "16px", border: "1px solid #e8e8e8", borderRadius: 10 } },
+          React.createElement("div", { style: { display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 } },
+            React.createElement("div", { style: { fontWeight: 700 } }, s.league_users && s.league_users.display_name),
+            s.score != null && React.createElement(Badge, { color: "purple" }, "\u2B50 " + Number(s.score).toFixed(1))
+          ),
+          React.createElement("div", { style: { fontSize: 12, color: "#666", fontStyle: "italic", marginBottom: 12, padding: "8px 12px", background: "#f8f9fc", borderRadius: 6 } }, '"' + s.prediction_text + '"'),
+          React.createElement("div", { style: { display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap" } },
+            React.createElement("div", null,
+              React.createElement("label", { style: { display: "block", fontSize: 12, fontWeight: 600, color: "#888", marginBottom: 4 } }, "PUNTEGGIO"),
+              React.createElement("input", { type: "number", step: "0.5", min: "0", max: "100", value: scores[s.id] || "", onChange: ev => setScores(sc => ({ ...sc, [s.id]: ev.target.value })), style: { width: 100, padding: "8px 10px", border: "1px solid #e0e0e0", borderRadius: 8, fontSize: 16, fontFamily: "inherit", outline: "none" }, placeholder: "es. 8.5" })
+            ),
+            React.createElement("div", { style: { flex: 1, minWidth: 180 } },
+              React.createElement("label", { style: { display: "block", fontSize: 12, fontWeight: 600, color: "#888", marginBottom: 4 } }, "NOTE"),
+              React.createElement("input", { type: "text", value: scoreNotes[s.id] || "", onChange: ev => setScoreNotes(n => ({ ...n, [s.id]: ev.target.value })), style: { width: "100%", padding: "8px 10px", border: "1px solid #e0e0e0", borderRadius: 8, fontSize: 14, fontFamily: "inherit", outline: "none" }, placeholder: "Note..." })
+            ),
+            React.createElement(Btn, { onClick: () => saveScore(s.id), disabled: savingScore[s.id], small: true },
+              savingScore[s.id] ? React.createElement(Spin, { size: 14 }) : "Salva"
+            )
+          )
+        ))
+      )
+    ),
+
+    // Giornate tab
+    tab === "matchdays" && React.createElement(Card, null,
+      React.createElement("h2", { style: { margin: "0 0 16px", fontSize: 18, fontWeight: 700 } }, "Stato giornate"),
+      React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 2 } },
+        mds.map(md => {
+          const st = mdStatus(md);
+          return React.createElement("div", { key: md.id, style: { display: "flex", justifyContent: "space-between", alignItems: "center", padding: "12px 0", borderBottom: "1px solid #f5f5f5" } },
+            React.createElement("span", { style: { fontWeight: 600, color: "#1a1a2e", minWidth: 50 } }, "G" + md.number),
+            React.createElement(Badge, { color: st.badge }, st.label),
+            !md.is_completed && md.is_open && React.createElement(Btn, { color: md.is_frozen ? "green" : "blue", small: true, onClick: () => toggleFreeze(md) }, md.is_frozen ? "Scongela" : "Congela")
+          );
+        })
+      )
+    ),
+
+    // Audit tab
+    tab === "audit" && React.createElement(Card, { style: { overflowX: "auto" } },
+      React.createElement("h2", { style: { margin: "0 0 16px", fontSize: 18, fontWeight: 700 } }, "Audit log"),
+      React.createElement("table", { style: { width: "100%", borderCollapse: "collapse" } },
+        React.createElement("thead", null,
+          React.createElement("tr", { style: { borderBottom: "2px solid #f0f0f0" } },
+            ["DATA/ORA","UTENTE","GIORNATA","AZIONE","TESTO"].map(h => React.createElement("th", { key: h, style: { textAlign: "left", padding: "8px 10px", fontSize: 11, color: "#888", fontWeight: 700 } }, h))
+          )
+        ),
+        React.createElement("tbody", null,
+          audit.map(a => React.createElement("tr", { key: a.id, style: { borderBottom: "1px solid #f8f8f8" } },
+            React.createElement("td", { style: { padding: "8px 10px", fontSize: 11, color: "#888", whiteSpace: "nowrap" } }, new Date(a.logged_at).toLocaleString("it-IT")),
+            React.createElement("td", { style: { padding: "8px 10px", fontSize: 13, fontWeight: 500 } }, a.league_users && a.league_users.display_name || a.user_id),
+            React.createElement("td", { style: { padding: "8px 10px", fontSize: 13 } }, "G" + (a.matchdays && a.matchdays.number)),
+            React.createElement("td", { style: { padding: "8px 10px" } }, React.createElement(Badge, { color: a.action === "FAILED" ? "red" : a.action === "CREATE" ? "green" : "blue" }, a.action)),
+            React.createElement("td", { style: { padding: "8px 10px", fontSize: 11, color: "#666", maxWidth: 280, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, a.prediction_text || a.error_message || "—")
+          )),
+          audit.length === 0 && React.createElement("tr", null, React.createElement("td", { colSpan: 5, style: { textAlign: "center", padding: 30, color: "#aaa" } }, "Nessun evento"))
+        )
+      )
+    ),
+
+    // Passwords tab
+    tab === "passwords" && React.createElement(Card, null,
+      React.createElement("h2", { style: { margin: "0 0 8px", fontSize: 18, fontWeight: 700 } }, "Gestione password"),
+      React.createElement("p", { style: { color: "#888", fontSize: 14, marginBottom: 20 } }, "Imposta una nuova password per qualsiasi partecipante"),
+      React.createElement("div", { style: { display: "flex", flexDirection: "column", gap: 12 } },
+        users.map(u => React.createElement("div", { key: u.id, style: { display: "flex", alignItems: "center", gap: 12, padding: "12px 0", borderBottom: "1px solid #f0f0f0" } },
+          React.createElement("div", { style: { flex: 1 } },
+            React.createElement("div", { style: { fontWeight: 600, color: "#1a1a2e" } }, u.display_name),
+            React.createElement("div", { style: { fontSize: 12, color: "#aaa" } }, "@" + u.username)
+          ),
+          React.createElement("input", { type: "password", placeholder: "Nuova password", value: passwords[u.id] || "", onChange: ev => setPasswords(p => ({ ...p, [u.id]: ev.target.value })), style: { padding: "8px 12px", border: "1px solid #e0e0e0", borderRadius: 8, fontSize: 14, fontFamily: "inherit", outline: "none", width: 160 } }),
+          React.createElement(Btn, { small: true, onClick: () => changePassword(u.id), disabled: pwResult[u.id] === "saving" },
+            pwResult[u.id] === "saving" ? React.createElement(Spin, { size: 14 }) : pwResult[u.id] === "saved" ? "Salvata" : "Cambia"
+          )
+        ))
+      )
+    )
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App() {
+  const state = useStore();
+  const [page, setPage] = useState("home");
+
+  if (state.loading) {
+    return React.createElement("div", { style: { minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "linear-gradient(135deg, #0f0c29, #302b63)" } },
+      React.createElement("div", { style: { textAlign: "center", color: "#fff" } },
+        React.createElement("div", { style: { fontSize: 52, marginBottom: 16 } }, "\u26BD"),
+        React.createElement(Spin, { size: 40 })
+      )
+    );
+  }
+
+  if (!state.auth) return React.createElement(LoginPage, null);
+
+  const { user } = state.auth;
+  const pages = {
+    home: React.createElement(HomePage, { user }),
+    standings: React.createElement(StandingsPage, { user }),
+    calendar: React.createElement(CalendarPage, { user }),
+    history: React.createElement(HistoryPage, { user }),
+    admin: user.is_admin ? React.createElement(AdminPage, { user }) : React.createElement(Alert, { type: "error" }, "Accesso negato"),
+  };
+
+  return React.createElement(Layout, { user, page, setPage }, pages[page] || pages.home);
+}
+
+ReactDOM.render(React.createElement(App, null), document.getElementById("root"));
+
+</script>
+</body>
+</html>
