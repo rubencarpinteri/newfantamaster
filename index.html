@@ -224,9 +224,9 @@ function LoginPage() {
 // ── Layout ────────────────────────────────────────────────────────────────────
 function Layout({ user, page, setPage, children }) {
   const navItems = [
-    { id: "home", label: "HOME", icon: "🏠" },
-    { id: "standings", label: "CLASSIFICA", icon: "🏆" },
-    { id: "calendar", label: "CALENDARIO", icon: "📅" },
+    { id: "home", label: "Home", icon: "🏠" },
+    { id: "standings", label: "Classifica", icon: "🏆" },
+    { id: "calendar", label: "Calendario", icon: "📅" },
     ...(user.is_admin ? [] : [{ id: "history", label: "STORICO", icon: "📖" }]),
     ...(user.is_admin ? [{ id: "admin", label: "Admin", icon: "⚙️" }] : []),
   ];
