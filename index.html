@@ -85,17 +85,17 @@ async function validateSession(token) {
 // ── Load matches ──────────────────────────────────────────────────────────────
 async function loadMatches(matchdayId) {
   const [rawM, teams] = await Promise.all([
-    dbGet("matches", "?matchday_id=eq." + matchdayId + "&select=id,home_team_id,away_team_id,home_goals,away_goals,home_fantapunti,away_fantapunti,result,is_played&order=id.asc"),
+    dbGet("matches", "?matchday_id=eq." + matchdayId + "&select=id,_team_id,away_team_id,_goals,away_goals,_fantapunti,away_fantapunti,result,is_played&order=id.asc"),
     dbGet("teams", "?select=id,name")
   ]);
   const tm = {};
   teams.forEach(t => { tm[t.id] = t.name; });
-  return (rawM || []).map(m => ({ ...m, home_name: tm[m.home_team_id] || "?", away_name: tm[m.away_team_id] || "?" }));
+  return (rawM || []).map(m => ({ ...m, _name: tm[m._team_id] || "?", away_name: tm[m.away_team_id] || "?" }));
 }
 
 // ── Prediction text helpers ───────────────────────────────────────────────────
 function buildText(picks, matches) {
-  return matches.map(m => m.home_name + " vs " + m.away_name + ": " + (picks[m.id] || "?")).join(" | ");
+  return matches.map(m => m._name + " vs " + m.away_name + ": " + (picks[m.id] || "?")).join(" | ");
 }
 function parseText(text, matches) {
   const picks = {};
@@ -103,7 +103,7 @@ function parseText(text, matches) {
   text.split(" | ").forEach(part => {
     const rx = /^(.+) vs (.+): ([1X2?])$/.exec(part);
     if (!rx) return;
-    const m = matches.find(mx => mx.home_name === rx[1] && mx.away_name === rx[2]);
+    const m = matches.find(mx => mx._name === rx[1] && mx.away_name === rx[2]);
     if (m) picks[m.id] = rx[3];
   });
   return picks;
@@ -224,10 +224,10 @@ function LoginPage() {
 // ── Layout ────────────────────────────────────────────────────────────────────
 function Layout({ user, page, setPage, children }) {
   const navItems = [
-    { id: "home", label: "Home", icon: "🏠" },
-    { id: "standings", label: "Classifica", icon: "🏆" },
-    { id: "calendar", label: "Calendario", icon: "📅" },
-    ...(user.is_admin ? [] : [{ id: "history", label: "Storico", icon: "📖" }]),
+    { id: "home", label: "HOME", icon: "🏠" },
+    { id: "standings", label: "CLASSIFICA", icon: "🏆" },
+    { id: "calendar", label: "CALENDARIO", icon: "📅" },
+    ...(user.is_admin ? [] : [{ id: "history", label: "STORICO", icon: "📖" }]),
     ...(user.is_admin ? [{ id: "admin", label: "Admin", icon: "⚙️" }] : []),
   ];
   function logout() {
