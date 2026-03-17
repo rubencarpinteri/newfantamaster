@@ -606,41 +606,32 @@ function StandingsPage({ user }) {
   const [loading, setLoading] = useState(true);
   useEffect(() => {
     (async () => {
-      // Load all completed matchdays, their matches (with results), and all predictions
       const [users, mds] = await Promise.all([
         dbGet("league_users", "?is_admin=eq.false&select=id,display_name,username&order=display_name.asc"),
         dbGet("matchdays", "?is_completed=eq.true&select=id,number&order=number.asc")
       ]);
       if (!mds || !mds.length) { setRows((users||[]).map(u=>({...u,correct:0,wrong:0,played:0}))); setLoading(false); return; }
-      // Load all matches + all predictions for completed matchdays in bulk
-      const mdIds = mds.map(m => m.id);
-      const [allMatches, allPreds] = await Promise.all([
-        dbGet("matches", "?matchday_id=in.(" + mdIds.join(",") + ")&is_played=eq.true&select=id,matchday_id,home_team_id,away_team_id,result"),
-        dbGet("predictions", "?matchday_id=in.(" + mdIds.join(",") + ")&select=user_id,matchday_id,prediction_text")
-      ]);
-      // Build team name map (not needed, we just need result)
-      // For each user, count correct/wrong across all completed matchdays
       const map = {};
       (users||[]).forEach(u => { map[u.id] = { ...u, correct: 0, wrong: 0, played: 0 }; });
-      (allPreds||[]).forEach(pred => {
-        if (!map[pred.user_id]) return;
-        const mdMatches = (allMatches||[]).filter(m => m.matchday_id === pred.matchday_id);
-        // Parse prediction text: "TeamA vs TeamB: 1 | ..."
-        // We need match id -> result mapping, but prediction text uses team names
-        // Load matches with team names for this matchday was done in loadMatches helper
-        // Here we do a simpler approach: match by position in prediction text
-        const parts = (pred.prediction_text || "").split(" | ");
-        parts.forEach((part, idx) => {
-          const rx = /^(.+) vs (.+): ([1X2?])$/.exec(part);
-          if (!rx || rx[3] === "?") return;
-          // Find the match by position (matches are ordered by id)
-          const m = mdMatches[idx];
-          if (!m || !m.result) return;
-          map[pred.user_id].played++;
-          if (rx[3] === m.result) map[pred.user_id].correct++;
-          else map[pred.user_id].wrong++;
+      // Process each completed matchday one by one with full match data
+      for (const md of mds) {
+        const [matches, preds] = await Promise.all([
+          loadMatches(md.id),
+          dbGet("predictions", "?matchday_id=eq." + md.id + "&select=user_id,prediction_text")
+        ]);
+        (preds||[]).forEach(pred => {
+          if (!map[pred.user_id]) return;
+          const userPicks = parseText(pred.prediction_text, matches);
+          matches.forEach(m => {
+            if (!m.is_played || !m.result) return;
+            const pick = userPicks[m.id];
+            if (!pick || pick === "?") return;
+            map[pred.user_id].played++;
+            if (pick === m.result) map[pred.user_id].correct++;
+            else map[pred.user_id].wrong++;
+          });
         });
-      });
+      }
       const sorted = Object.values(map).sort((a, b) => b.correct - a.correct || a.wrong - b.wrong);
       setRows(sorted); setLoading(false);
     })();
@@ -652,13 +643,11 @@ function StandingsPage({ user }) {
     React.createElement("p", { style: { color: "#888", fontSize: 14, marginBottom: 24 } }, "Pronostici corretti nelle giornate completate"),
     React.createElement(Card, null,
       React.createElement("div", { style: { display: "grid", gridTemplateColumns: "auto 1fr auto auto auto", gap: "0 16px", alignItems: "center" } },
-        // Header
         React.createElement("div", null),
         React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#aaa", letterSpacing: "0.06em", padding: "8px 0" } }, "PARTECIPANTE"),
         React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#10b981", letterSpacing: "0.06em", textAlign: "center" } }, "\u2713"),
         React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#ef4444", letterSpacing: "0.06em", textAlign: "center" } }, "\u2717"),
         React.createElement("div", { style: { fontSize: 11, fontWeight: 700, color: "#888", letterSpacing: "0.06em", textAlign: "center" } }, "TOT"),
-        // Rows
         ...rows.map((r, i) => [
           React.createElement("div", { key: r.id+"pos", style: { width: 32, textAlign: "center", fontSize: i < 3 ? 20 : 14, fontWeight: 700, color: i < 3 ? "#1a1a2e" : "#aaa", padding: "12px 0", borderTop: i > 0 ? "1px solid #f5f5f5" : "none" } }, i < 3 ? medals[i] : (i+1)),
           React.createElement("div", { key: r.id+"name", style: { padding: "12px 0", borderTop: i > 0 ? "1px solid #f5f5f5" : "none" } },
